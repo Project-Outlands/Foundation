@@ -40,9 +40,8 @@ public record LoadingContext(Package pkg, Manifest manifest, URL codeSourceUrl) 
             return; // defensive: an unbalanced pop must never break class loading
         }
         stack.pop();
-        if (stack.isEmpty()) {
-            STACK.remove();
-        }
+        // ArrayDeque.pop clears the element reference. Keep the empty JDK container so consecutive
+        // top-level class loads do not allocate another deque, backing array and ThreadLocal entry.
     }
 
     /**

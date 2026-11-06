@@ -62,6 +62,11 @@ public class ActualClassLoader extends URLClassLoader {
     private final ClassPathIndex classPathIndex;
 
     private final ThreadLocal<byte[]> loadBuffer = new ThreadLocal<>();
+    /** A scoped lookup, not a resource cache: keep virtual getClassBytes calls and nested loads intact. */
+    private final ThreadLocal<ClassFileLookup> classFileLookup = new ThreadLocal<>();
+
+    private record ClassFileLookup(String name, URL resource) {
+    }
 
     private static final String[] RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
     private static final boolean DUMP = Boolean.parseBoolean(System.getProperty("foundation.dump", "false"));
@@ -197,12 +202,13 @@ public class ActualClassLoader extends URLClassLoader {
             return parent.loadClass(name);
         }
 
-        if (cachedClasses.containsKey(name)) {
-            return cachedClasses.get(name);
-        }
+        final Class<?> cached = cachedClasses.get(name);
+        if (cached != null) return cached;
 
         byte[] transformedClass;
         boolean contextPushed = false;
+        final ClassFileLookup previousLookup = classFileLookup.get();
+        boolean lookupPushed = false;
 
         try {
             final String transformedName = transformName(name);
@@ -213,9 +219,8 @@ public class ActualClassLoader extends URLClassLoader {
                     transformerHolder.debugPrinter.run();
                 }
             }
-            if (cachedClasses.containsKey(transformedName)) {
-                return cachedClasses.get(transformedName);
-            }
+            final Class<?> transformedCached = cachedClasses.get(transformedName);
+            if (transformedCached != null) return transformedCached;
 
             final String untransformedName = untransformName(name);
 
@@ -223,6 +228,8 @@ public class ActualClassLoader extends URLClassLoader {
             final String packageName = lastDot == -1 ? "" : untransformedName.substring(0, lastDot);
             final String fileName = untransformedName.replace('.', '/').concat(".class");
             final URL classFile = findClassFile(fileName);
+            classFileLookup.set(new ClassFileLookup(cacheKey(untransformedName), classFile));
+            lookupPushed = true;
             final JarInfo jarInfo = jarInfoFor(classFile);
 
             CodeSigner[] signers = null;
@@ -321,6 +328,10 @@ public class ActualClassLoader extends URLClassLoader {
             }
             throw new ClassNotFoundException(name, e);
         } finally {
+            if (lookupPushed) {
+                if (previousLookup == null) classFileLookup.remove();
+                else classFileLookup.set(previousLookup);
+            }
             if (contextPushed) {
                 LoadingContext.pop();
             }
@@ -417,18 +428,40 @@ public class ActualClassLoader extends URLClassLoader {
         }
 
         synchronized (addURLLock) {
-            if (sourceSet.contains(url.toExternalForm())) {
+            final String source = url.toExternalForm();
+            if (sourceSet.contains(source)) {
                 return;
             }
             super.addURL(url);
             sources.add(url);
-            sourceSet.add(url.toExternalForm());
+            sourceSet.add(source);
             classPathIndex.add(url);
         }
     }
 
     public List<URL> getSources() {
         return sources;
+    }
+
+    @Override
+    public void close() throws IOException {
+        try (classPathIndex; Closeable cachedJars = this::closeJarInfos) {
+            super.close();
+        }
+    }
+
+    private void closeJarInfos() throws IOException {
+        IOException failure = null;
+        for (JarInfo jar : jarInfos.values()) {
+            try {
+                jar.jarFile.close();
+            } catch (IOException error) {
+                if (failure == null) failure = error;
+                else failure.addSuppressed(error);
+            }
+        }
+        jarInfos.clear();
+        if (failure != null) throw failure;
     }
 
     /** A jar of the classpath, with its manifest kept strongly referenced. */
@@ -466,14 +499,34 @@ public class ActualClassLoader extends URLClassLoader {
             if (!(connection instanceof JarURLConnection jarConnection)) {
                 return null;
             }
+            // These handles belong to this loader, not the JDK's process-wide JarFile cache.
+            jarConnection.setUseCaches(false);
             final JarFile jarFile = jarConnection.getJarFile();
-            loaded = new JarInfo(jarFile, jarFile.getManifest(), jarConnection.getJarFileURL());
+            try {
+                loaded = new JarInfo(jarFile, jarFile.getManifest(), jarConnection.getJarFileURL());
+            } catch (IOException | RuntimeException error) {
+                closeSilently(jarFile);
+                throw error;
+            }
         } catch (IOException | RuntimeException e) {
             LOGGER.debug("Could not read the jar of {}", classFile, e);
             return null;
         }
         final JarInfo previous = jarInfos.putIfAbsent(key, loaded);
+        if (previous != null) closeSilently(loaded.jarFile);
         return previous == null ? loaded : previous;
+    }
+
+    private InputStream openClassStream(URL resource) throws IOException {
+        final JarInfo jar = jarInfoFor(resource);
+        final URLConnection connection = resource.openConnection();
+        connection.setUseCaches(false);
+        if (jar != null && connection instanceof JarURLConnection jarConnection) {
+            final JarEntry entry = jar.jarFile.getJarEntry(jarConnection.getEntryName());
+            if (entry == null) throw new java.io.FileNotFoundException(resource.toExternalForm());
+            return jar.jarFile.getInputStream(entry);
+        }
+        return connection.getInputStream();
     }
 
     /**
@@ -523,8 +576,8 @@ public class ActualClassLoader extends URLClassLoader {
     protected byte[] getOrCreateBuffer() {
         byte[] buffer = loadBuffer.get();
         if (buffer == null) {
-            loadBuffer.set(new byte[BUFFER_SIZE]);
-            buffer = loadBuffer.get();
+            buffer = new byte[BUFFER_SIZE];
+            loadBuffer.set(buffer);
         }
         return buffer;
     }
@@ -568,16 +621,23 @@ public class ActualClassLoader extends URLClassLoader {
         return name.indexOf('/') < 0 ? name : name.replace('/', '.');
     }
 
+    private URL classResource(String key) {
+        final ClassFileLookup lookup = classFileLookup.get();
+        if (lookup != null && lookup.name.equals(key)) return lookup.resource;
+        return findClassFile(key.replace('.', '/').concat(".class"));
+    }
+
     public byte[] getClassBytes(String name) throws IOException {
         final String key = cacheKey(name);
         if (negativeResourceCache.contains(key)) {
             return null;
-        } else if (resourceCache.containsKey(key)) {
-            return resourceCache.get(key);
         }
+        final byte[] cached = resourceCache.get(key);
+        if (cached != null) return cached;
         if (key.indexOf('.') == -1) {
+            final String upperName = key.toUpperCase(Locale.ENGLISH);
             for (final String reservedName : RESERVED_NAMES) {
-                if (key.toUpperCase(Locale.ENGLISH).startsWith(reservedName)) {
+                if (upperName.startsWith(reservedName)) {
                     final byte[] data = getClassBytes("_" + key);
                     if (data != null) {
                         resourceCache.put(key, data);
@@ -589,14 +649,13 @@ public class ActualClassLoader extends URLClassLoader {
 
         InputStream classStream = null;
         try {
-            final String resourcePath = key.replace('.', '/').concat(".class");
-            final URL classResource = findClassFile(resourcePath);
+            final URL classResource = classResource(key);
 
             if (classResource == null) {
                 negativeResourceCache.add(key);
                 return null;
             }
-            classStream = classResource.openStream();
+            classStream = openClassStream(classResource);
 
             final byte[] data = readFully(classStream);
             resourceCache.put(key, data);
@@ -608,12 +667,12 @@ public class ActualClassLoader extends URLClassLoader {
 
     public byte[] testGetClassBytes(String name) throws IOException {
         final String key = cacheKey(name);
-        if (resourceCache.containsKey(key)) {
-            return resourceCache.get(key);
-        }
+        final byte[] cached = resourceCache.get(key);
+        if (cached != null) return cached;
         if (key.indexOf('.') == -1) {
+            final String upperName = key.toUpperCase(Locale.ENGLISH);
             for (final String reservedName : RESERVED_NAMES) {
-                if (key.toUpperCase(Locale.ENGLISH).startsWith(reservedName)) {
+                if (upperName.startsWith(reservedName)) {
                     final byte[] data = getClassBytes("_" + key);
                     if (data != null) {
                         resourceCache.put(key, data);
@@ -625,13 +684,12 @@ public class ActualClassLoader extends URLClassLoader {
 
         InputStream classStream = null;
         try {
-            final String resourcePath = key.replace('.', '/').concat(".class");
-            final URL classResource = findClassFile(resourcePath);
+            final URL classResource = classResource(key);
 
             if (classResource == null) {
                 return null;
             }
-            classStream = classResource.openStream();
+            classStream = openClassStream(classResource);
 
             return readFully(classStream);
         } finally {

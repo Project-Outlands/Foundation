@@ -13,9 +13,9 @@ import java.lang.classfile.ClassFile;
 import java.lang.classfile.ClassHierarchyResolver.ClassHierarchyInfo;
 import java.lang.classfile.ClassHierarchyResolver;
 import java.lang.constant.ClassDesc;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
@@ -87,13 +87,12 @@ public class TransformerDelegate {
         LOGGER.debug("Registering explicit transformer instance: {}", transformer.getClass().getSimpleName());
         try {
             for (var target : targets) {
-                if (explicitTransformers.containsKey(target)) {
-                    explicitTransformers.get(target).add(transformer);
-                } else {
-                    var transformerSet = new PriorityQueue<>(Comparator.comparingInt(IExplicitTransformer::getPriority));
-                    transformerSet.add(transformer);
-                    explicitTransformers.put(target, transformerSet);
+                var queue = explicitTransformers.get(target);
+                if (queue == null) {
+                    queue = new PriorityQueue<>(Comparator.comparingInt(IExplicitTransformer::getPriority));
+                    explicitTransformers.put(target, queue);
                 }
+                queue.add(transformer);
             }
 
         } catch (Exception e) {
@@ -138,7 +137,7 @@ public class TransformerDelegate {
     public static void unRegisterTransformer(String name) {
         LOGGER.debug("Unregistering all transformers call: {}", name);
         try {
-            transformers.stream().filter(transformer -> transformer.getClass().getName().equals(name)).forEach(transformers::remove);
+            transformers.removeIf(transformer -> transformer.getClass().getName().equals(name));
             transformers.sort(Comparator.comparingInt(IClassTransformer::getPriority));
         } catch (Exception e) {
             LOGGER.error("Error removing transformer class {}", name, e);
@@ -203,7 +202,7 @@ public class TransformerDelegate {
      */
     static void fillTransformerHolder(TransformerHolder holder) {
         explicitTransformers = new TreeMap<>();
-        transformers = new LinkedList<>();
+        transformers = new ArrayList<>();
         if (DEBUG_TRANSFORMER) {
             final ClassFile verifier = ClassFile.of(ClassFile.ClassHierarchyResolverOption.of(
                     newRemappingHierarchyResolver()));
@@ -239,32 +238,28 @@ public class TransformerDelegate {
         holder.registerTransformerFunction = TransformerDelegate::registerTransformer;
         if (DEBUG_TRANSFORMER) {
             holder.runExplicitTransformersFunction = (name, basicClass) -> {
-                if (explicitTransformers.containsKey(name)) {
-                    PriorityQueue<IExplicitTransformer> queue = explicitTransformers.get(name);
-                    if (queue != null) {
-                        while (!queue.isEmpty()) {
-                            IExplicitTransformer transformer = queue.poll();
-                            byte[] before = basicClass;
-                            basicClass = transformer.transform(basicClass); // We are not doing hotswap, so classes only loaded once. Let's free their memory
-                            if (basicClass != before && basicClass != null) {
-                                LOGGER.debug("Class {} has been modified by explicit transformer {}", name, transformer);
-                            }
+                PriorityQueue<IExplicitTransformer> queue = explicitTransformers.get(name);
+                if (queue != null) {
+                    while (!queue.isEmpty()) {
+                        IExplicitTransformer transformer = queue.poll();
+                        byte[] before = basicClass;
+                        basicClass = transformer.transform(basicClass); // Classes only load once; release consumed transformers.
+                        if (basicClass != before && basicClass != null) {
+                            LOGGER.debug("Class {} has been modified by explicit transformer {}", name, transformer);
                         }
-                        explicitTransformers.remove(name); // GC
                     }
+                    explicitTransformers.remove(name); // GC
                 }
                 return basicClass;
             };
         } else {
             holder.runExplicitTransformersFunction = (name, basicClass) -> {
-                if (explicitTransformers.containsKey(name)) {
-                    PriorityQueue<IExplicitTransformer> queue = explicitTransformers.get(name);
-                    if (queue != null) {
-                        while (!queue.isEmpty()) {
-                            basicClass = queue.poll().transform(basicClass); // We are not doing hotswap, so classes only loaded once. Let's free their memory
-                        }
-                        explicitTransformers.remove(name); // GC
+                PriorityQueue<IExplicitTransformer> queue = explicitTransformers.get(name);
+                if (queue != null) {
+                    while (!queue.isEmpty()) {
+                        basicClass = queue.poll().transform(basicClass);
                     }
+                    explicitTransformers.remove(name); // GC
                 }
                 return basicClass;
             };

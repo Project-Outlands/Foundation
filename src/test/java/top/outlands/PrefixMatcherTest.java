@@ -5,6 +5,9 @@ import top.outlands.foundation.boot.PrefixMatcher;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.LinkedHashSet;
+import java.util.Random;
+import java.util.Comparator;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -19,6 +22,38 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PrefixMatcherTest {
+
+    @Test
+    void indexedMatchingAgreesWithLinearMatchingThroughMutations() {
+        PrefixMatcher matcher = new PrefixMatcher();
+        LinkedHashSet<String> expected = new LinkedHashSet<>();
+        Random random = new Random(20261106);
+        String[] pool = new String[256];
+        pool[0] = "";
+        pool[1] = "com.";
+        pool[2] = "com.foo.";
+        pool[3] = "com.foo.child.";
+        pool[4] = "com.foo.children.";
+        pool[5] = "λ./";
+        for (int i = 6; i < pool.length; i++) pool[i] = "com.mod" + random.nextInt(80) + ".pkg" + random.nextInt(20);
+        assertFalse(matcher.matches(null), "an empty matcher does not inspect the name");
+        for (int step = 0; step < 1000; step++) {
+            String prefix = pool[random.nextInt(pool.length)];
+            List<String> oldView = matcher.prefixes();
+            List<String> oldValues = List.copyOf(oldView);
+            if (random.nextBoolean()) assertEquals(expected.add(prefix), matcher.add(prefix));
+            else assertEquals(expected.remove(prefix), matcher.remove(prefix));
+            assertEquals(oldValues, oldView, "published snapshots must not change");
+            assertEquals(expected.stream().sorted(Comparator.comparingInt(String::length)).toList(), matcher.prefixes());
+            for (int query = 0; query < 50; query++) {
+                String name = query % 2 == 0 ? pool[random.nextInt(pool.length)] + "Type" : "unmatched." + query;
+                assertEquals(expected.stream().anyMatch(name::startsWith), matcher.matches(name), name);
+            }
+        }
+        matcher.add("x");
+        assertThrows(NullPointerException.class, () -> matcher.matches(null));
+        assertThrows(UnsupportedOperationException.class, () -> matcher.prefixes().add("z"));
+    }
 
     @Test
     void matchingIsBarePrefixWithoutPackageBoundary() {

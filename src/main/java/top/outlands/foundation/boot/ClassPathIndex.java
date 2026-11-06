@@ -1,6 +1,7 @@
 package top.outlands.foundation.boot;
 
 import java.io.File;
+import java.io.Closeable;
 import java.io.IOException;
 import java.net.MalformedURLException;
 import java.net.URL;
@@ -29,7 +30,7 @@ import java.util.zip.ZipFile;
  */
 
 @SuppressWarnings("deprecation")
-public final class ClassPathIndex {
+public final class ClassPathIndex implements Closeable {
 
     /** Returned by {@link #lookup(String)} when the caller has to use the regular findResource lookup. */
     public static final Object UNKNOWN = new Object();
@@ -44,10 +45,13 @@ public final class ClassPathIndex {
     private final List<Source> sources = new ArrayList<>();
     /** Classpath positions of each package directory, ascending. */
     private final Map<String, int[]> packages = new HashMap<>();
+    /** Directories are mutable: probe them at their original positions without scanning their trees. */
+    private int[] directories = NO_POSITIONS;
     /** URLs already placed, so a Class-Path entry is used once. */
     private final Set<String> placed = new HashSet<>();
     /** First position whose contribution is unknown; MAX_VALUE while the whole order is known. */
     private int barrier = Integer.MAX_VALUE;
+    private boolean closed;
 
     public ClassPathIndex(URL[] urls) {
         synchronized (this) {
@@ -63,6 +67,7 @@ public final class ClassPathIndex {
             return;
         }
         synchronized (this) {
+            if (closed) return;
             addLocked(url);
         }
     }
@@ -71,13 +76,23 @@ public final class ClassPathIndex {
      * @return the URL findResource would return, null if it would return null, or {@link #UNKNOWN}
      */
     public synchronized Object lookup(String path) {
+        if (closed) return UNKNOWN;
         if (barrier == 0 || !isPlain(path)) {
             // the JDK percent-encodes the URL; not worth reproducing for class files
             return UNKNOWN;
         }
         final int slash = path.lastIndexOf('/');
         final int[] positions = packages.getOrDefault(slash < 0 ? "" : path.substring(0, slash + 1), NO_POSITIONS);
-        for (int position : positions) {
+        int packageIndex = 0;
+        int directoryIndex = 0;
+        while (packageIndex < positions.length || directoryIndex < directories.length) {
+            final int position;
+            if (directoryIndex < directories.length
+                    && (packageIndex == positions.length || directories[directoryIndex] < positions[packageIndex])) {
+                position = directories[directoryIndex++];
+            } else {
+                position = positions[packageIndex++];
+            }
             if (position >= barrier) {
                 return UNKNOWN;
             }
@@ -87,6 +102,28 @@ public final class ClassPathIndex {
             }
         }
         return barrier == Integer.MAX_VALUE ? null : UNKNOWN;
+    }
+
+    @Override
+    public synchronized void close() throws IOException {
+        if (closed) return;
+        closed = true;
+        IOException failure = null;
+        for (Source source : sources) {
+            if (source instanceof JarSource jar) {
+                try {
+                    jar.file.close();
+                } catch (IOException error) {
+                    if (failure == null) failure = error;
+                    else failure.addSuppressed(error);
+                }
+            }
+        }
+        sources.clear();
+        packages.clear();
+        directories = NO_POSITIONS;
+        placed.clear();
+        if (failure != null) throw failure;
     }
 
     private void addLocked(URL url) {
@@ -120,7 +157,12 @@ public final class ClassPathIndex {
     }
 
     private void indexPackages(Source source, int position) {
-        for (String packagePath : packagesOf(source)) {
+        if (source instanceof DirSource) {
+            directories = Arrays.copyOf(directories, directories.length + 1);
+            directories[directories.length - 1] = position;
+            return;
+        }
+        for (String packagePath : ((JarSource) source).packages()) {
             final int[] old = packages.getOrDefault(packagePath, NO_POSITIONS);
             final int[] updated = Arrays.copyOf(old, old.length + 1);
             updated[old.length] = position;
@@ -196,13 +238,6 @@ public final class ClassPathIndex {
         return urls.toArray(NO_URLS);
     }
 
-    private static List<String> packagesOf(Source source) {
-        if (source instanceof DirSource dirSource) {
-            return dirSource.packages();
-        }
-        return ((JarSource) source).packages();
-    }
-
     private record DirSource(URL base, File dir) implements Source {
 
         @Override
@@ -214,34 +249,6 @@ public final class ClassPathIndex {
                 return new URL(base, path);
             } catch (MalformedURLException e) {
                 return null;
-            }
-        }
-
-        /** Directories that contain files, which is what a package lookup can ask for. */
-        private List<String> packages() {
-            final List<String> result = new ArrayList<>();
-            collect(dir, "", result, 0);
-            return result;
-        }
-
-        private static void collect(File current, String path, List<String> result, int depth) {
-            if (depth > 64) {
-                return; // symbolic link loop
-            }
-            final File[] children = current.listFiles();
-            if (children == null) {
-                return;
-            }
-            boolean hasFiles = false;
-            for (File child : children) {
-                if (child.isDirectory()) {
-                    collect(child, path + child.getName() + '/', result, depth + 1);
-                } else {
-                    hasFiles = true;
-                }
-            }
-            if (hasFiles) {
-                result.add(path);
             }
         }
     }
@@ -325,6 +332,11 @@ public final class ClassPathIndex {
 
     /** Whether the JDK builds the resource URL from the path unchanged, so the indexed URL is identical. */
     private static boolean isPlain(String path) {
+        // Let URLClassLoader perform its canonical-path checks for directory traversal/absolute paths.
+        if (path.startsWith("/") || path.equals(".") || path.equals("..")
+                || path.startsWith("./") || path.startsWith("../")
+                || path.contains("/./") || path.contains("/../")
+                || path.endsWith("/.") || path.endsWith("/..")) return false;
         for (int i = 0; i < path.length(); i++) {
             final char c = path.charAt(i);
             final boolean plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
