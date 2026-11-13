@@ -18,19 +18,51 @@ public class Foundation {
 
     public static void main(String[] args) {
         Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> Foundation.LOGGER.error(thread, throwable));
-        // The process main thread becomes the client thread; anchor it for the SDL marshaling executor.
-        MainThreadExecutor.init();
-        // macOS: initialize AWT on the main thread so the JVM attaches a Cocoa run loop to it,
-        // which SDL requires for the video/event subsystem (same pattern as RetroFuturaBootstrap).
-        if (System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("mac")) {
-            System.setProperty("java.awt.headless", "true");
-            try {
-                GraphicsEnvironment.getLocalGraphicsEnvironment();
-                Toolkit.getDefaultToolkit().getDesktopProperty("awt.mouse.numButtons");
-            } catch (Throwable t) {
-                LOGGER.warn("Failed to initialize AWT on the main thread", t);
-            }
+        try {
+            prepareFirstThread();
+        } catch (Throwable t) {
+            LOGGER.fatal("Unable to prepare the first thread", t);
+            System.exit(1);
         }
+        // RetroFuturaBootstrap style: the game runs on a new thread while the process's first thread
+        // services SDL/Cocoa work. SDL requires the first thread for its video and event subsystems.
+        MainThreadExecutor.start("Foundation-Main", () -> launch(args));
+    }
+
+    /**
+     * On macOS the process's first thread is the only one allowed to talk to SDL/Cocoa, and it is only
+     * the JVM's AppKit main thread when {@code -XstartOnFirstThread} was passed. Headless AWT is
+     * initialized here so that later AWT access from other threads cannot wait on a missing Cocoa run
+     * loop (the same pattern RetroFuturaBootstrap uses).
+     */
+    private static void prepareFirstThread() {
+        if (!System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("mac")) {
+            return;
+        }
+        if (!Boolean.getBoolean("foundation.skip_first_thread_check") && !startedOnFirstThread()) {
+            throw new IllegalStateException(
+                    "Foundation must be started with -XstartOnFirstThread on macOS: SDL may only create the "
+                            + "window and pump events on the process first thread. Add the flag to the JVM arguments, "
+                            + "or set -Dfoundation.skip_first_thread_check=true if the launcher already guarantees it.");
+        }
+        System.setProperty("java.awt.headless", "true");
+        try {
+            GraphicsEnvironment.getLocalGraphicsEnvironment();
+            Toolkit.getDefaultToolkit().getDesktopProperty("awt.mouse.numButtons");
+        } catch (Throwable t) {
+            LOGGER.warn("Failed to initialize AWT on the first thread", t);
+        }
+    }
+
+    /**
+     * The JDK launcher sets this environment variable when {@code -XstartOnFirstThread} is used (see the
+     * macOS {@code java_md_macosx.m}); libGDX uses the same probe.
+     */
+    private static boolean startedOnFirstThread() {
+        return "1".equals(System.getenv("JAVA_STARTED_ON_FIRST_THREAD_" + ProcessHandle.current().pid()));
+    }
+
+    private static void launch(String[] args) {
         try {
             breakModuleAndReflection();
             if (Launch.classLoader == null) {
