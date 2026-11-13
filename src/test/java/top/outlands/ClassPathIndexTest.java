@@ -29,6 +29,49 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class ClassPathIndexTest {
 
     @Test
+    void newDirectoryPackagesShadowLaterJarsAndDeletedFilesFallThrough(@TempDir Path dir) throws Exception {
+        Path classes = Files.createDirectory(dir.resolve("classes"));
+        Path later = JarBuilder.first(dir, "later.jar").entry("generated/New.class", "jar").build();
+        URL[] urls = {classes.toUri().toURL(), later.toUri().toURL()};
+        try (ClassPathIndex index = new ClassPathIndex(urls);
+             URLClassLoader reference = new URLClassLoader(urls, null)) {
+            assertEquals(reference.findResource("generated/New.class"), index.lookup("generated/New.class"));
+            Path generated = Files.createDirectories(classes.resolve("generated"));
+            Path file = Files.writeString(generated.resolve("New.class"), "new directory class");
+            assertEquals(file.toUri().toURL(), index.lookup("generated/New.class"));
+            assertEquals(reference.findResource("generated/New.class"), index.lookup("generated/New.class"));
+            Files.delete(file);
+            assertEquals(reference.findResource("generated/New.class"), index.lookup("generated/New.class"));
+        }
+    }
+
+    @Test
+    void directoriesAddedLaterKeepJarAndManifestOrder(@TempDir Path dir) throws Exception {
+        Path first = JarBuilder.first(dir, "first.jar").classPath("generated/").entry("same/Type.class", "first").build();
+        Path last = JarBuilder.first(dir, "last.jar").entry("late/Type.class", "last").build();
+        URL[] urls = {first.toUri().toURL(), last.toUri().toURL()};
+        try (ClassPathIndex index = new ClassPathIndex(urls);
+             URLClassLoader reference = new URLClassLoader(urls, null)) {
+            Path generated = Files.createDirectories(dir.resolve("generated"));
+            Files.writeString(Files.createDirectories(generated.resolve("same")).resolve("Type.class"), "shadowed");
+            Path file = Files.writeString(Files.createDirectories(generated.resolve("late")).resolve("Type.class"), "generated");
+            assertEquals(reference.findResource("same/Type.class"), index.lookup("same/Type.class"));
+            assertEquals(file.toUri().toURL(), index.lookup("late/Type.class"));
+            assertEquals(reference.findResource("late/Type.class"), index.lookup("late/Type.class"));
+            assertNull(index.lookup("missing/Type.class"));
+        }
+    }
+
+    @Test
+    void nonCanonicalPathsDeferToTheJdk(@TempDir Path dir) throws Exception {
+        try (ClassPathIndex index = new ClassPathIndex(new URL[]{dir.toUri().toURL()})) {
+            for (String path : List.of("../Outside.class", "./Type.class", "a/../Type.class", "/Type.class", "a/./Type.class")) {
+                assertSame(ClassPathIndex.UNKNOWN, index.lookup(path));
+            }
+        }
+    }
+
+    @Test
     void plainJarsAreAnsweredFromTheIndex(@TempDir Path dir) throws Exception {
         JarBuilder.first(dir, "first.jar")
                 .entry("one/A.class", "A1")
@@ -135,8 +178,8 @@ class ClassPathIndexTest {
 
         URL[] urls = urls(dir, "first.jar");
         URL added = dir.resolve("added.jar").toUri().toURL();
-        ClassPathIndex index = new ClassPathIndex(urls);
-        try (AddableClassLoader loader = new AddableClassLoader(urls)) {
+        try (ClassPathIndex index = new ClassPathIndex(urls);
+             AddableClassLoader loader = new AddableClassLoader(urls)) {
             assertNull(index.lookup("late/B.class"), "not on the classpath yet");
             loader.addURL(added);
             index.add(added);
@@ -151,12 +194,13 @@ class ClassPathIndexTest {
         JarBuilder.first(dir, "jar.jar").entry("one/A.class", "A1").build();
         URL[] urls = {new URL("http://example.invalid/remote.jar"), dir.resolve("jar.jar").toUri().toURL()};
 
-        ClassPathIndex index = new ClassPathIndex(urls);
-        assertSame(
+        try (ClassPathIndex index = new ClassPathIndex(urls)) {
+            assertSame(
                 ClassPathIndex.UNKNOWN,
                 index.lookup("one/A.class"),
                 "an entry the index can't read makes everything after it unknown");
-        assertSame(ClassPathIndex.UNKNOWN, index.lookup("two/Missing.class"));
+            assertSame(ClassPathIndex.UNKNOWN, index.lookup("two/Missing.class"));
+        }
     }
 
     @Test
@@ -190,8 +234,8 @@ class ClassPathIndexTest {
 
     /** Asserts that the index and the JDK agree on every path, and that the index answered at all. */
     private static void assertMatches(URL[] urls, List<String> paths) throws IOException {
-        ClassPathIndex index = new ClassPathIndex(urls);
-        try (URLClassLoader reference = new URLClassLoader(urls, null)) {
+        try (ClassPathIndex index = new ClassPathIndex(urls);
+             URLClassLoader reference = new URLClassLoader(urls, null)) {
             for (String path : paths) {
                 final URL expected = reference.findResource(path);
                 final Object actual = index.lookup(path);
