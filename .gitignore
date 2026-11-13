@@ -29,3 +29,7 @@ nbproject
 /repo/
 /bin/
 .codegraph
+
+# AI
+/.pi
+/.serena
