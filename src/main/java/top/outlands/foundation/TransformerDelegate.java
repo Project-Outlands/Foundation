@@ -2,7 +2,6 @@ package top.outlands.foundation;
 
 import net.minecraft.launchwrapper.IClassNameTransformer;
 import net.minecraft.launchwrapper.IClassTransformer;
-import net.minecraft.launchwrapper.Launch;
 import top.outlands.foundation.boot.TransformerHolder;
 
 import org.objectweb.asm.ClassReader;
@@ -15,11 +14,11 @@ import java.lang.classfile.ClassHierarchyResolver;
 import java.lang.constant.ClassDesc;
 import java.util.Arrays;
 import java.util.Comparator;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.TreeMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import static net.minecraft.launchwrapper.Launch.classLoader;
 import static top.outlands.foundation.boot.Foundation.LOGGER;
@@ -203,7 +202,7 @@ public class TransformerDelegate {
      */
     static void fillTransformerHolder(TransformerHolder holder) {
         explicitTransformers = new TreeMap<>();
-        transformers = new LinkedList<>();
+        transformers = new CopyOnWriteArrayList<>();
         if (DEBUG_TRANSFORMER) {
             final ClassFile verifier = ClassFile.of(ClassFile.ClassHierarchyResolverOption.of(
                     newRemappingHierarchyResolver()));
