@@ -11,6 +11,7 @@ import java.util.Set;
 import java.util.function.Consumer;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import top.outlands.foundation.install.ZipFingerprint;
 
 /**
  * The entries of one archive: a name lookup, a prefix scan, and the file contents read straight from the
@@ -25,16 +26,25 @@ import java.util.jar.JarFile;
  * the 0.06 µs of the hash lookup, and building it costs 0.35 ms per archive, which is 50% of the whole
  * class path index. Prefix scans enumerate the entries instead, which is what a scan does anyway.
  *
- * <p>The archive is the caller's to close.
+ * <p>The archive is the caller's to close, unless an {@link ArchiveSet} opened it.
  */
 public final class ArchiveIndex {
 
     /** The archive the entries are read from. */
     private final JarFile archive;
+    /** Where the archive was read from, when the set opened it. */
+    private final java.nio.file.Path path;
     /** Package directories of every entry, which is what a package lookup can ask for. */
     private final List<String> packages;
+    /** The central directory aggregate, computed on demand: only cache keys need it. */
+    private volatile ZipFingerprint fingerprint;
 
     public ArchiveIndex(JarFile archive) {
+        this(null, archive);
+    }
+
+    public ArchiveIndex(java.nio.file.Path path, JarFile archive) {
+        this.path = path;
         this.archive = archive;
         final Set<String> packageNames = new HashSet<>();
         for (final Enumeration<JarEntry> all = archive.entries(); all.hasMoreElements(); ) {
@@ -56,6 +66,61 @@ public final class ArchiveIndex {
     /** @return the package directory of every entry */
     public List<String> packages() {
         return packages;
+    }
+
+    /** @return the archive this indexes; closing it invalidates the index */
+    public JarFile jarFile() {
+        return archive;
+    }
+
+    /** @return where the archive was read from, or null when it was handed over already open */
+    public java.nio.file.Path path() {
+        return path;
+    }
+
+    /**
+     * @return the fingerprint of the central directory, which a cache key can be built from without reading the
+     *         archive twice; {@link ZipFingerprint}-shaped so both stay comparable
+     * @throws IllegalStateException when this index was handed an open archive rather than opened by an
+     *         {@link ArchiveSet}, because the fingerprint also covers the file's length
+     */
+    public ZipFingerprint fingerprint() {
+        ZipFingerprint known = fingerprint;
+        if (known == null) {
+            known = computeFingerprint();
+            fingerprint = known;
+        }
+        return known;
+    }
+
+    private ZipFingerprint computeFingerprint() {
+        if (path == null) {
+            throw new IllegalStateException("this index was not opened by an ArchiveSet, so its file length is unknown");
+        }
+        // sorted by name, so a jar written in another entry order still fingerprints the same
+        final List<JarEntry> entries = new ArrayList<>();
+        for (final Enumeration<JarEntry> all = archive.entries(); all.hasMoreElements(); ) {
+            entries.add(all.nextElement());
+        }
+        entries.sort(java.util.Comparator.comparing(JarEntry::getName));
+        final java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        final java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        for (final JarEntry entry : entries) {
+            crc.update(entry.getName().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            buffer.clear();
+            buffer.putInt((int) entry.getCrc());
+            crc.update(buffer.array(), 0, 4);
+            buffer.clear();
+            buffer.putLong(entry.getSize());
+            crc.update(buffer.array(), 0, 8);
+        }
+        final long size;
+        try {
+            size = java.nio.file.Files.size(path);
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException("cannot size " + path, e);
+        }
+        return new ZipFingerprint(entries.size(), crc.getValue(), size);
     }
 
     /**

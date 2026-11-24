@@ -50,8 +50,15 @@ public final class ClassPathIndex {
     private final Set<String> placed = new HashSet<>();
     /** First position whose contribution is unknown; MAX_VALUE while the whole order is known. */
     private int barrier = Integer.MAX_VALUE;
+    /** Where the archives come from; the class loader shares one set for the whole process. */
+    private final ArchiveSet archives;
 
     public ClassPathIndex(URL[] urls) {
+        this(urls, ArchiveSet.classPath());
+    }
+
+    public ClassPathIndex(URL[] urls, ArchiveSet archives) {
+        this.archives = archives;
         synchronized (this) {
             for (URL url : urls) {
                 addLocked(url);
@@ -174,17 +181,16 @@ public final class ClassPathIndex {
         if (!file.isFile()) {
             return null; // the JDK skips classpath entries it cannot open
         }
-        final JarFile jarFile;
+        // one handle per archive for the whole process: whoever needs the same jar again gets this one
+        final ArchiveIndex index;
         try {
-            jarFile = new JarFile(file, true, ZipFile.OPEN_READ, JarFile.runtimeVersion());
+            index = archives.open(file.toPath());
         } catch (IOException | RuntimeException e) {
             return null;
         }
         try {
-            return new JarSource(url, new URL("jar", "", -1, url.toExternalForm() + "!/"), jarFile,
-                    new ArchiveIndex(jarFile));
+            return new JarSource(url, new URL("jar", "", -1, url.toExternalForm() + "!/"), index.jarFile(), index);
         } catch (MalformedURLException e) {
-            closeSilently(jarFile);
             return null;
         }
     }
@@ -310,13 +316,6 @@ public final class ClassPathIndex {
         }
     }
 
-    private static void closeSilently(JarFile file) {
-        try {
-            file.close();
-        } catch (IOException ignored) {
-            // nothing to do
-        }
-    }
 
     private static File toFile(URL url) {
         try {
