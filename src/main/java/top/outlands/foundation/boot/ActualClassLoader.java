@@ -590,6 +590,15 @@ public class ActualClassLoader extends URLClassLoader {
         InputStream classStream = null;
         try {
             final String resourcePath = key.replace('.', '/').concat(".class");
+            final byte[] indexed = readFromIndex(resourcePath);
+            if (indexed != NO_BYTES) {
+                if (indexed == null) {
+                    negativeResourceCache.add(key);
+                    return null;
+                }
+                resourceCache.put(key, indexed);
+                return indexed;
+            }
             final URL classResource = findClassFile(resourcePath);
 
             if (classResource == null) {
@@ -626,6 +635,10 @@ public class ActualClassLoader extends URLClassLoader {
         InputStream classStream = null;
         try {
             final String resourcePath = key.replace('.', '/').concat(".class");
+            final byte[] indexed = readFromIndex(resourcePath);
+            if (indexed != NO_BYTES) {
+                return indexed;
+            }
             final URL classResource = findClassFile(resourcePath);
 
             if (classResource == null) {
@@ -637,6 +650,24 @@ public class ActualClassLoader extends URLClassLoader {
         } finally {
             closeSilently(classStream);
         }
+    }
+
+    /** Marks "the index cannot answer this path", which is not the same as "no such file". */
+    private static final byte[] NO_BYTES = new byte[0];
+
+    /**
+     * Asks the class path index for the bytes of a class file, which reads the archive entry directly
+     * instead of building a {@code jar:} URL and asking a {@link JarURLConnection} for a stream.
+     *
+     * @return the bytes, null when the class path has no such file, or {@link #NO_BYTES} when the caller
+     *         has to fall back to {@link #findClassFile(String)}
+     */
+    private byte[] readFromIndex(String resourcePath) throws IOException {
+        final Object indexed = classPathIndex.read(resourcePath);
+        if (indexed == ClassPathIndex.UNKNOWN) {
+            return NO_BYTES;
+        }
+        return (byte[]) indexed;
     }
 
     public void printDebugMessage() {

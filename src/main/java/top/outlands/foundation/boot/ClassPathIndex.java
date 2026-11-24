@@ -2,13 +2,13 @@ package top.outlands.foundation.boot;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
-import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -19,7 +19,6 @@ import java.util.jar.Attributes;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.Manifest;
-import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 /**
@@ -39,6 +38,9 @@ public final class ClassPathIndex {
 
     private sealed interface Source permits JarSource, DirSource {
         URL find(String path);
+
+        /** @return the file contents, or null when this source has no such file */
+        byte[] read(String path) throws IOException;
     }
 
     private final List<Source> sources = new ArrayList<>();
@@ -84,6 +86,31 @@ public final class ClassPathIndex {
             final URL url = sources.get(position).find(path);
             if (url != null) {
                 return url;
+            }
+        }
+        return barrier == Integer.MAX_VALUE ? null : UNKNOWN;
+    }
+
+    /**
+     * Reads a class file from the entry {@link #lookup(String)} would have found, without building a
+     * {@code jar:} URL and without a {@link java.net.JarURLConnection}. Same search order, same answers.
+     *
+     * @return the bytes, null when no entry has the file, or {@link #UNKNOWN} when the caller has to use
+     *         {@code findResource(path)}
+     */
+    public synchronized Object read(String path) throws IOException {
+        if (barrier == 0 || !isPlain(path)) {
+            return UNKNOWN;
+        }
+        final int slash = path.lastIndexOf('/');
+        final int[] positions = packages.getOrDefault(slash < 0 ? "" : path.substring(0, slash + 1), NO_POSITIONS);
+        for (int position : positions) {
+            if (position >= barrier) {
+                return UNKNOWN;
+            }
+            final byte[] bytes = sources.get(position).read(path);
+            if (bytes != null) {
+                return bytes;
             }
         }
         return barrier == Integer.MAX_VALUE ? null : UNKNOWN;
@@ -149,12 +176,13 @@ public final class ClassPathIndex {
         }
         final JarFile jarFile;
         try {
-            jarFile = new JarFile(file, false, ZipFile.OPEN_READ, JarFile.runtimeVersion());
+            jarFile = new JarFile(file, true, ZipFile.OPEN_READ, JarFile.runtimeVersion());
         } catch (IOException | RuntimeException e) {
             return null;
         }
         try {
-            return new JarSource(url, new URL("jar", "", -1, url.toExternalForm() + "!/"), jarFile);
+            return new JarSource(url, new URL("jar", "", -1, url.toExternalForm() + "!/"), jarFile,
+                    new ArchiveIndex(jarFile));
         } catch (MalformedURLException e) {
             closeSilently(jarFile);
             return null;
@@ -217,6 +245,12 @@ public final class ClassPathIndex {
             }
         }
 
+        @Override
+        public byte[] read(String path) throws IOException {
+            final File file = new File(dir, path);
+            return file.isFile() ? Files.readAllBytes(file.toPath()) : null;
+        }
+
         /** Directories that contain files, which is what a package lookup can ask for. */
         private List<String> packages() {
             final List<String> result = new ArrayList<>();
@@ -248,52 +282,31 @@ public final class ClassPathIndex {
 
     /**
      * @param source  Jar URL, which Class-Path entries are resolved against. 
-     * @param base  {@code jar:...!/} URL, which resources are resolved against.  */
-    private record JarSource(URL source, URL base, JarFile file) implements Source {
+     * @param base  {@code jar:...!/} URL, which resources are resolved against.  
+     * @param index  the entries of {@code file}, which is what a lookup and a read consult  */
+    private record JarSource(URL source, URL base, JarFile file, ArchiveIndex index) implements Source {
 
         @Override
         public URL find(String path) {
-            final ZipEntry entry = file.getEntry(path);
+            final JarEntry entry = index.find(path);
             if (entry == null) {
                 return null;
             }
             // a multi-release jar serves the copy the runtime version selects
-            final String realName = entry instanceof JarEntry jarEntry ? jarEntry.getRealName() : null;
             try {
-                return new URL(base, realName == null ? path : realName);
+                return new URL(base, ArchiveIndex.realName(entry));
             } catch (MalformedURLException e) {
                 return null;
             }
         }
 
+        @Override
+        public byte[] read(String path) throws IOException {
+            return index.read(index.find(path));
+        }
+
         private List<String> packages() {
-            final Set<String> result = new HashSet<>();
-            final Enumeration<JarEntry> entries = file.entries();
-            while (entries.hasMoreElements()) {
-                final String name = entries.nextElement().getName();
-                if (name.endsWith("/")) {
-                    continue;
-                }
-                // versioned copies are asked for under their unversioned name
-                result.add(packageOf(name));
-                result.add(packageOf(unversion(name)));
-            }
-            return new ArrayList<>(result);
-        }
-
-        private static final String VERSIONS = "META-INF/versions/";
-
-        private static String packageOf(String name) {
-            final int slash = name.lastIndexOf('/');
-            return slash < 0 ? "" : name.substring(0, slash + 1);
-        }
-
-        private static String unversion(String name) {
-            if (!name.startsWith(VERSIONS)) {
-                return name;
-            }
-            final int slash = name.indexOf('/', VERSIONS.length());
-            return slash < 0 ? name : name.substring(slash + 1);
+            return index.packages();
         }
     }
 
