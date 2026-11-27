@@ -431,6 +431,14 @@ public class ActualClassLoader extends URLClassLoader {
         return sources;
     }
 
+    /**
+     * @return the first classpath position the index cannot model, or -1 when it can model all of them; see
+     *         {@link ClassPathIndex#unknownFrom()}, which this reports for the manifest
+     */
+    public int classPathUnknownFrom() {
+        return classPathIndex.unknownFrom();
+    }
+
     /** A jar of the classpath, with its manifest kept strongly referenced. */
     private record JarInfo(JarFile jarFile, Manifest manifest, URL jarUrl) {
     }

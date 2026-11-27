@@ -19,7 +19,6 @@ import java.util.jar.Attributes;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.Manifest;
-import java.util.zip.ZipFile;
 
 /**
  * Maps a package directory to the classpath entries containing it, so finding a class file probes only
@@ -74,6 +73,14 @@ public final class ClassPathIndex {
         synchronized (this) {
             addLocked(url);
         }
+    }
+
+    /**
+     * @return the first classpath position whose contribution the index cannot predict, or -1 when the whole order
+     *         is known; a searcher past that position has to fall back to the regular resource lookup
+     */
+    public synchronized int unknownFrom() {
+        return barrier == Integer.MAX_VALUE ? -1 : barrier;
     }
 
     /**
